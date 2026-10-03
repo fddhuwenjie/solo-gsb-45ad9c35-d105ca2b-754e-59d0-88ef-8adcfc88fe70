@@ -35,6 +35,7 @@ from .batches import validate_batch_body
 from .common import ClientError, ConflictError, NotFound, stable_hash
 from .compare import compare_assessments
 from .fulfillment import UnprocessableError, check_fulfillment
+from .ledger import SnapshotUnverifiable
 from .remediation import RemediationConflict, plan_remediation
 from .responsibility import PartialPlanError, build_plan
 from .revisions import REVISION_ID_LEN
@@ -142,17 +143,18 @@ class Api:
         The envelope (base revision + 1..50 unique assessment ids) is
         validated here; every stateful precondition (the base revision
         still being active, the target revision existing, each assessment
-        belonging to the ruleset and recording that active revision) is
-        confirmed by the store in a single read transaction, which either
-        yields the whole batch or raises ConflictError -- never a partial
+        belonging to the ruleset, recording that active revision and
+        loading as a verified immutable accounting snapshot) is confirmed
+        by the store in a single read transaction, which either yields
+        the whole batch or raises ConflictError -- never a partial
         report.
         """
         base_revision, ids = validate_review_body(body)
-        target_rules, rows = self.store.review_impact_inputs(
+        target_rules, snapshots = self.store.review_impact_inputs(
             name, target_revision, base_revision, ids
         )
         return build_impact_report(
-            name, target_revision, base_revision, rows, target_rules
+            name, target_revision, base_revision, snapshots, target_rules
         )
 
     # -- assessments ------------------------------------------------------
@@ -202,44 +204,53 @@ class Api:
 
     # -- confirmation -----------------------------------------------------
 
+    @staticmethod
+    def _snapshot_refusal(verb, aid, exc):
+        """Phrase a snapshot verification failure in the endpoint's words.
+
+        Legacy rows keep the historical explanations (inline rules that
+        were never persisted vs. a ruleset that can no longer be
+        verified); a row that *has* a pinned snapshot but fails the
+        correspondence checks is reported as unverifiable.  All of them
+        are HTTP 409 refusals -- never a fabricated replay.
+        """
+        if exc.legacy and not exc.ruleset:
+            reason = (
+                "the assessment used inline rules that were never persisted; "
+                "re-submit the assessment to bind a rules snapshot"
+            )
+        elif exc.legacy:
+            reason = (
+                "the original ruleset %r can no longer be verified "
+                "(ruleset deleted or overwritten since the assessment)"
+                % exc.ruleset
+            )
+        else:
+            reason = "its persisted accounting snapshot cannot be verified"
+        return ConflictError("cannot %s assessment %r: %s" % (verb, aid, reason))
+
     def confirm(self, aid):
-        row = self.store.get_assessment(aid)
-        if row is None:
-            raise NotFound("assessment %r not found" % aid)
         existing = self.store.get_confirmation(aid)
         if existing is not None:
             return existing
-        result = row["result"]
-        if result.get("status") != "ok":
+        # A confirmation is only minted from the verified immutable
+        # accounting snapshot (see app/ledger.py): the pinned rules the
+        # assessment ran with, never the currently active ruleset.
+        # Pre-upgrade rows continue only when their rules can be restored
+        # and re-proven inside the same read transaction; anything else
+        # is refused as a whole.
+        try:
+            snap = self.store.load_snapshot(aid)
+        except SnapshotUnverifiable as exc:
+            raise self._snapshot_refusal("confirm", aid, exc)
+        if snap.status != "ok":
             raise ConflictError(
                 "assessment status is %r; no release conclusion available"
-                % result.get("status")
+                % snap.status
             )
-        # A confirmation is only minted when the exact rules the assessment
-        # ran with are known.  Newer rows always carry the pinned snapshot;
-        # pre-upgrade rows are accepted only when their rules can be verified
-        # and restored (see Store.recover_legacy_rules).  A deleted/overwritten
-        # ruleset or a legacy inline-rule request can never be reconstructed --
-        # refuse rather than fabricate a replay that may not reproduce.
-        rules = row["rules"]
-        if rules is None:
-            rules = self.store.recover_legacy_rules(aid)
-        if rules is None:
-            if not row["ruleset"]:
-                reason = (
-                    "the assessment used inline rules that were never persisted; "
-                    "re-submit the assessment to bind a rules snapshot"
-                )
-            else:
-                reason = (
-                    "the original ruleset %r can no longer be verified "
-                    "(ruleset deleted or overwritten since the assessment)"
-                    % row["ruleset"]
-                )
-            raise ConflictError(
-                "cannot confirm assessment %r: %s" % (aid, reason)
-            )
-        conf = build_confirmation(row["request"], result, rules, aid, row["ruleset"])
+        conf = build_confirmation(
+            snap.request, snap.result, snap.rules, aid, snap.ruleset
+        )
         self.store.put_confirmation(aid, conf)
         return conf
 
@@ -306,16 +317,19 @@ class Api:
     # -- remediation plan ---------------------------------------------------
 
     def remediation_plan(self, aid, body):
-        row = self.store.get_assessment(aid)
-        if row is None:
-            raise NotFound("assessment %r not found" % aid)
-        # plan_remediation verifies the pinned normalized request and
-        # rules snapshot itself and refuses (409) when it cannot prove
-        # them or the status is not "conflict" -- never falling back to
-        # current active rules.
-        if row["rules"] is None:
-            row["rules"] = self.store.recover_legacy_rules(aid)
-        return plan_remediation(row, body, aid)
+        # The shared immutable accounting snapshot verifies the pinned
+        # normalized request, rules snapshot, persisted result and
+        # recorded revision itself and refuses (409) when it cannot prove
+        # them -- never falling back to current active rules.
+        try:
+            snap = self.store.load_snapshot(aid)
+        except SnapshotUnverifiable as exc:
+            raise ConflictError(
+                "cannot plan remediation for assessment %r: %s"
+                % (aid, exc.detail),
+                {"reason": "rules-snapshot-unverifiable"},
+            )
+        return plan_remediation(snap, body, aid)
 
     # -- comparison -----------------------------------------------------
 
@@ -328,38 +342,18 @@ class Api:
             raise ClientError("baseline_id must be a non-empty string")
         if not isinstance(target_id, str) or not target_id:
             raise ClientError("target_id must be a non-empty string")
-        baseline = self._assessment_with_rules(baseline_id)
-        target = self._assessment_with_rules(target_id)
+        # Both assessments load as verified immutable accounting
+        # snapshots inside ONE read transaction (see app/ledger.py), so
+        # the diff and its hash projections cover a single consistent
+        # view.  Pre-upgrade rows continue only when their rules can be
+        # restored and re-proven; a deleted/overwritten ruleset or a
+        # legacy inline-rule request can never be reconstructed --
+        # refuse rather than comparing against guessed rules.
+        try:
+            baseline, target = self.store.load_snapshots([baseline_id, target_id])
+        except SnapshotUnverifiable as exc:
+            raise self._snapshot_refusal("compare", exc.assessment_id, exc)
         return compare_assessments(baseline, target)
-
-    def _assessment_with_rules(self, aid):
-        """Fetch an assessment row, refusing ones without provable rules.
-
-        Pre-upgrade rows are accepted only when their rules can be
-        verified and restored (the same rule confirmations follow); a
-        deleted/overwritten ruleset or a legacy inline-rule request can
-        never be reconstructed -- refuse rather than comparing against
-        guessed rules.
-        """
-        row = self.store.get_assessment(aid)
-        if row is None:
-            raise NotFound("assessment %r not found" % aid)
-        if row["rules"] is None:
-            row["rules"] = self.store.recover_legacy_rules(aid)
-        if row["rules"] is None:
-            if not row["ruleset"]:
-                reason = (
-                    "the assessment used inline rules that were never persisted; "
-                    "re-submit the assessment to bind a rules snapshot"
-                )
-            else:
-                reason = (
-                    "the original ruleset %r can no longer be verified "
-                    "(ruleset deleted or overwritten since the assessment)"
-                    % row["ruleset"]
-                )
-            raise ConflictError("cannot compare assessment %r: %s" % (aid, reason))
-        return row
 
     # -- immutable release batches ----------------------------------------
 

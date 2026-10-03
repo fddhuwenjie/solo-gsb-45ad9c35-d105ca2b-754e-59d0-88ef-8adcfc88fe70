@@ -413,32 +413,21 @@ def _build_payload(assessment_id, norm, choices, picked, mode, result, release):
 # main entry point
 # ---------------------------------------------------------------------------
 
-def plan_remediation(row, body, assessment_id):
+def plan_remediation(snapshot, body, assessment_id):
     """Plan component license remediation for one persisted conflict.
 
-    The caller guarantees the assessment exists; the pinned normalized
-    request and rules snapshot are both verified here -- re-running the
-    original assessment with its own snapshot must reproduce the stored
-    ``summary_hash``.  An unverifiable snapshot, or a non-``conflict``
-    assessment, raises :class:`ConflictError` (HTTP 409); current active
-    rules are never substituted.
+    The caller guarantees the assessment exists; *snapshot* is the shared
+    immutable accounting snapshot (see ``app/ledger.py``) whose pinned
+    normalized request, rules snapshot, persisted result and recorded
+    revision were already verified to correspond -- re-running the
+    original assessment with its own snapshot reproduces the stored
+    ``summary_hash``.  A non-``conflict`` assessment raises
+    :class:`ConflictError` (HTTP 409); current active rules are never
+    substituted.
     """
-    rules = row["rules"]
-    norm = row["request"]
-    stored = row["result"]
-    if rules is None:
-        raise ConflictError(
-            "cannot plan remediation for assessment %r: its rules snapshot "
-            "can no longer be verified" % assessment_id,
-            {"reason": "rules-snapshot-unverifiable"},
-        )
-    replayed = assess_normalized(norm, rules)
-    if replayed.get("summary_hash") != stored.get("summary_hash"):
-        raise ConflictError(
-            "cannot plan remediation for assessment %r: the persisted request "
-            "and rules snapshot do not reproduce the stored result" % assessment_id,
-            {"reason": "rules-snapshot-unverifiable"},
-        )
+    rules = snapshot.rules
+    norm = snapshot.request
+    stored = snapshot.result
     if stored.get("status") != "conflict":
         raise ConflictError(
             "assessment status is %r; remediation planning requires status "

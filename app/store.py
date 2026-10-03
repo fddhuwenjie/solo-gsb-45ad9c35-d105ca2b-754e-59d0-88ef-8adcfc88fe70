@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from .batches import assemble_manifest, canonical_entries
 from .common import ConflictError, NotFound, stable_hash
 from .fulfillment import UnprocessableError
+from .ledger import SnapshotUnverifiable, verify_snapshot
 from .revisions import revision_id
 from .solver import assess_normalized
 
@@ -275,6 +276,105 @@ class Store:
                 return rules
             finally:
                 conn.close()
+
+    # -- shared immutable accounting snapshots ----------------------------
+
+    _SNAPSHOT_COLUMNS = "id, ruleset, rules, revision, request, result, summary_hash"
+
+    def _snapshot_from_row(self, conn, row):
+        """Assemble and verify one accounting snapshot inside *conn*'s
+        transaction.
+
+        Every correspondence check -- normalized request, persisted
+        result, stored ``summary_hash``, pinned rules snapshot and the
+        recorded revision -- reads through this one connection, so the
+        snapshot reflects a single consistent database view.  A legacy
+        row without a pinned snapshot continues only when its rules can
+        be restored and re-proven here (see
+        :meth:`_verified_legacy_rules`); anything else raises
+        :class:`SnapshotUnverifiable`.
+        """
+        aid = row["id"]
+        ruleset = row["ruleset"]
+        revision = row["revision"]
+        request = json.loads(row["request"])
+        result = json.loads(row["result"])
+        summary_hash = row["summary_hash"]
+        recovered = False
+        rules = json.loads(row["rules"]) if row["rules"] is not None else None
+        if rules is None:
+            # Legacy row: recover only when the original rules are
+            # provable from the same-transaction ruleset mirror and the
+            # re-computed summary_hash matches the stored one.
+            rules = self._verified_legacy_rules(conn, row)
+            if rules is None:
+                raise SnapshotUnverifiable(
+                    aid,
+                    ruleset,
+                    "legacy row without a pinned rules snapshot cannot be "
+                    "restored",
+                    legacy=True,
+                )
+            recovered = True
+        content_hash = None
+        if ruleset is not None:
+            if revision is None:
+                # Rows healed before revisions existed may lack the
+                # stamp; derive it from the snapshot content and require
+                # the revision row to exist with matching content.
+                revision = revision_id(rules)
+            rev_row = conn.execute(
+                "SELECT content_hash FROM ruleset_revisions"
+                " WHERE ruleset_name = ? AND revision = ?",
+                (ruleset, revision),
+            ).fetchone()
+            if rev_row is not None:
+                content_hash = rev_row["content_hash"]
+        return verify_snapshot(
+            aid, ruleset, revision, request, result, rules, summary_hash,
+            content_hash, recovered=recovered,
+        )
+
+    def load_snapshots(self, ids):
+        """Load verified accounting snapshots for *ids* in ONE transaction.
+
+        The whole batch is read and verified inside a single read-only
+        transaction, so every consumer (confirmation, comparison,
+        remediation planning, impact review) projects and hashes exactly
+        the same consistent view.  Raises :class:`NotFound` for an
+        unknown id and :class:`SnapshotUnverifiable` when a row's
+        persisted correspondence is broken or a legacy row cannot be
+        restored -- the callers map both onto their established 404/409
+        semantics and refuse the request as a whole.
+
+        Rows recovered from a legacy state are backfilled under the write
+        lock afterwards (best-effort, exactly like the legacy recovery
+        path); the returned snapshots never depend on that write.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            snapshots = []
+            for aid in ids:
+                row = conn.execute(
+                    "SELECT %s FROM assessments WHERE id = ?"
+                    % self._SNAPSHOT_COLUMNS,
+                    (aid,),
+                ).fetchone()
+                if row is None:
+                    raise NotFound("assessment %r not found" % aid)
+                snapshots.append(self._snapshot_from_row(conn, row))
+            conn.rollback()
+        finally:
+            conn.close()
+        for snap in snapshots:
+            if snap.recovered:
+                self.recover_legacy_rules(snap.id)
+        return snapshots
+
+    def load_snapshot(self, aid):
+        """Single-assessment convenience wrapper of :meth:`load_snapshots`."""
+        return self.load_snapshots([aid])[0]
 
     # -- rulesets (legacy PUT/GET semantics, revision-backed) -------------
 
@@ -764,14 +864,19 @@ class Store:
            equals ``base_revision`` (the revision the caller read when
            it created the draft);
         3. every requested assessment exists, belongs to *name* and
-           recorded that active revision.
+           recorded that active revision;
+        4. every assessment loads as a verified immutable accounting
+           snapshot (the shared loader of
+           :meth:`_snapshot_from_row`): normalized request, persisted
+           result, stored ``summary_hash``, pinned rules snapshot and
+           recorded revision all correspond.
 
         Any failure raises ConflictError -- the whole review is refused,
         no partial report is possible.  On success it returns
-        ``(target_rules, rows)`` where each row carries the assessment's
-        pinned normalized request and persisted result; the caller closes
-        the transaction (by returning) and only then runs the (CPU-bound)
-        re-evaluation.
+        ``(target_rules, snapshots)`` where each snapshot carries the
+        assessment's pinned normalized request and persisted result; the
+        caller closes the transaction (by returning) and only then runs
+        the (CPU-bound) re-evaluation.
         """
         conn = self._connect()
         try:
@@ -821,8 +926,8 @@ class Store:
             found = {
                 r["id"]: r
                 for r in conn.execute(
-                    "SELECT id, ruleset, revision, request, result"
-                    " FROM assessments WHERE id IN (%s)" % placeholders,
+                    "SELECT %s FROM assessments WHERE id IN (%s)"
+                    % (self._SNAPSHOT_COLUMNS, placeholders),
                     list(ids),
                 ).fetchall()
             }
@@ -867,16 +972,32 @@ class Store:
                     },
                 )
 
+            # The shared immutable accounting snapshot: every assessment
+            # is verified (request/result/summary_hash/rules/revision
+            # correspondence) inside this same transaction, exactly like
+            # the confirmation, comparison and remediation entries load
+            # it -- the review never trusts an unverifiable row and never
+            # falls back to different rules than those endpoints do.
+            snapshots = []
+            unverifiable = []
+            for aid in ids:
+                try:
+                    snapshots.append(self._snapshot_from_row(conn, found[aid]))
+                except SnapshotUnverifiable:
+                    unverifiable.append(aid)
+            if unverifiable:
+                raise ConflictError(
+                    "impact review refuses assessments whose persisted "
+                    "accounting snapshot cannot be verified: %s"
+                    % ", ".join(sorted(unverifiable)),
+                    {
+                        "reason": "rules-snapshot-unverifiable",
+                        "assessment_ids": sorted(unverifiable),
+                    },
+                )
+
             target_rules = json.loads(target["body"])
-            rows = [
-                {
-                    "id": found[aid]["id"],
-                    "request": json.loads(found[aid]["request"]),
-                    "result": json.loads(found[aid]["result"]),
-                }
-                for aid in ids
-            ]
-            return target_rules, rows
+            return target_rules, snapshots
         finally:
             conn.rollback()
             conn.close()

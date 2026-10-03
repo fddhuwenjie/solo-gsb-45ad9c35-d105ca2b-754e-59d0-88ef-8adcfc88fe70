@@ -28,7 +28,7 @@ python3 main.py
 数据持久化在 SQLite（容器内 `/data/app.db`，本地默认 `./data/app.db`，
 环境变量 `APP_DB` 可改）。
 
-自检（启动临时实例跑 520 项端到端检查）：
+自检（启动临时实例跑 562 项端到端检查）：
 
 ```bash
 python3 tests/selftest.py
@@ -1282,6 +1282,32 @@ curl -sS -X POST "$BASE/v1/assessments/compare" \
   -d "{\"baseline_id\": \"$BASE_ID\", \"target_id\": \"$TARGET_ID\"}"
 ```
 
+### 共享不可变核算快照
+
+确认（`confirm`）、对比（`compare`）、整改规划（`remediation-plan`）与规则
+发布影响审查（`impact-review`）读取核算与规则时，统一加载**同一份不可变
+核算快照**（`app/ledger.py`），绝不出现"一个入口回退活动规则、另一个使用
+历史规则"的分叉。快照在**同一只读事务**中装配并校验以下对应关系，全部
+通过才可用：
+
+- 规范化 `request` 与 `rules` 快照的哈希必须等于核算 id（id 绑定）；
+- 持久化 `result` 携带的 `summary_hash` 必须与 `summary_hash` 列一致，
+  且用该快照**重算**能复现同一 `summary_hash`；
+- 命名规则集的核算：记录的 `revision` 必须仍存在于
+  `ruleset_revisions`，且其 `content_hash` 与 `rules` 快照哈希一致
+  （内联规则的核算不得记录修订）。
+
+**旧数据库记录**（无 `rules` 快照列的升级前行）只有能还原出原始规则
+（同名规则集当前内容哈希到该核算 id）**且重算出相同 `summary_hash`** 才
+可继续，还原成功后在写锁下回填快照与修订；其余一律按各入口现有语义整体
+拒绝——确认/对比/整改对未知核算返回 **404**、对不可核验记录返回 **409**
+（整改为 `reason: "rules-snapshot-unverifiable"`），影响审查对任一失效
+ID 整体返回 **409**（不可核验为 `reason: "rules-snapshot-unverifiable"`），
+绝不产生部分结果。四个入口的排序（审查项按核算 id、差异编号、整改选择
+序列）与哈希投影（`confirmation_hash` / `comparison_hash` /
+`remediation_hash` / `report_hash`）都从这份快照派生，因此规则发布、
+回滚或并发激活都不会让它们看到不同的规则。
+
 ## 语义模型
 
 **表达式**：`AND` / `OR` / `WITH`、括号、许可证 id（含 `+` 后缀与
@@ -1348,6 +1374,7 @@ app/expression.py     SPDX 风格表达式解析（AND/OR/WITH）
 app/rules.py          默认规则集 + 规则校验规范化
 app/revisions.py      不可变修订标识：规范化内容哈希（修订 id / content_hash）
 app/review.py         发布前影响审查：批次信封校验、用目标修订不可变快照重算核算（旧/新状态、summary_hash、采用分支、义务差异、放行→冲突/错误汇总、report_hash）
+app/ledger.py         共享不可变核算快照：单只读事务内校验规范化请求/结果/summary_hash/规则快照/修订对应关系，旧记录仅可还原且重算匹配才可继续；确认/对比/整改/影响审查统一加载
 app/batches.py        不可变发布批次：批次信封校验（batch_id + 1～50 条目）、同事务快照核验与共享组件/制品去重合并（名称/版本/许可证一致校验、义务并集、rule_revisions、batch_hash）
 app/snapshot.py      批次履约状态快照：期限内材料按 all/any 证据规则判定去重后组件义务（satisfied/overdue/pending）、时区日期期限窗口、depends_on 最终截止日、缺口/命中材料与逾期汇总（snapshot_hash）
 app/solver.py         义务传播、OR 分支选择（穷举 + 分支定界）、冲突检测、确认版生成
@@ -1356,9 +1383,9 @@ app/schedule.py       义务截止日排期：RFC 3339/IANA 时区解析、日�
 app/responsibility.py 责任分工：责任项展开（制品级/组件级）、人员资格/容量/成本规范化、全局最优分工（穷举 + 最小费用流界的完备分支定界）、409 最佳部分方案与原因
 app/remediation.py   许可证整改：候选表达式/成本校验（非法整体 422）、在持久化快照上重算的全局最优异构组合（穷举 + 完备分支定界，精确有理数成本）、放行方案与 409 唯一最佳失败方案
 app/compare.py        核算对比：原子差异分解（稳定编号）、反事实回滚与全局最小归因集（按大小递增、ID 字典序完备枚举，非法中间状态不计命中）
-app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现、影响审查的单读事务前置条件核验、发布批次的单写事务登记（锁定核算与规则修订、全成或全败、幂等）
+app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变核算快照的单读事务装配、不可变修订/CAS 激活/激活审计的事务实现、影响审查的单读事务前置条件核验、发布批次的单写事务登记（锁定核算与规则修订、全成或全败、幂等）
 app/server.py         ThreadingHTTPServer JSON 路由
-tests/selftest.py     520 项端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查、不可变发布批次登记/幂等/合并冲突/快照不可变、批次履约状态快照：期限窗口/逾期判定/共享组件一次计数/顺序无关哈希）
+tests/selftest.py     562 项端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查、不可变发布批次登记/幂等/合并冲突/快照不可变、批次履约状态快照：期限窗口/逾期判定/共享组件一次计数/顺序无关哈希、共享核算快照：四入口投影一致/激活后稳定/篡改与旧记录整体拒绝）
 Dockerfile / docker-compose.yml / .dockerignore
 ```
 

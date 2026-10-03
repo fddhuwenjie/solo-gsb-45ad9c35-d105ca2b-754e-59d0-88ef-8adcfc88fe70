@@ -421,6 +421,9 @@ def run_checks():
     # -- fulfillment status snapshots over frozen batches -------------------
     run_batch_snapshot_checks()
 
+    # -- shared immutable accounting snapshot across the four readers -------
+    run_shared_snapshot_checks()
+
     # -- WITH exception removes propagation ----------------------------------
     exc_request = {
         "components": [
@@ -4371,6 +4374,271 @@ def run_batch_snapshot_checks():
           and bool(eout["snapshot_hash"]),
           json.dumps(eout.get("summary", {})),
     )
+
+
+def run_shared_snapshot_checks():
+    """Regression: confirm/compare/remediation/impact-review share one
+    verified immutable accounting snapshot.
+
+    A dedicated ruleset (v1: S-1.0/T-1.0 incompatible; v2: S-1.0 gains an
+    obligation) backs ok and conflict assessments.  The checks cover:
+    identical projections across the four entries, projections pinned to
+    the historical snapshot across rule activations (no entry falls back
+    to the active rules), tampered rows refused wholesale under the
+    existing 404/409 semantics, and legacy rows (rules snapshot NULL)
+    continuing only when restorable and re-proven.
+    """
+    v1 = {
+        "licenses": {
+            "S-1.0": {"obligations": ["attribution"]},
+            "T-1.0": {"obligations": ["attribution"],
+                      "incompatible_with": ["S-1.0"]},
+        }
+    }
+    v2 = {
+        "licenses": {
+            "S-1.0": {"obligations": ["attribution", "license-text"]},
+            "T-1.0": {"obligations": ["attribution"],
+                      "incompatible_with": ["S-1.0"]},
+        }
+    }
+    v1_hash = stable_hash(validate_ruleset(v1))
+
+    code, body = call("PUT", "/v1/rulesets/snap", v1)
+    check("ledger: ruleset published",
+          code == 200 and body.get("created") is True)
+    rev_v1 = call("GET", "/v1/rulesets/snap")[1]["active_revision"]
+
+    counter = [0]
+
+    def assess_ok():
+        counter[0] += 1
+        code, out = call("POST", "/v1/assessments", {
+            "ruleset": "snap", "product": "snap-ok-%d" % counter[0],
+            "components": [{"id": "t", "license": "S-1.0"}],
+        })
+        assert code == 200, out
+        return out["id"], out["result"]["summary_hash"]
+
+    def assess_conflict():
+        counter[0] += 1
+        code, out = call("POST", "/v1/assessments", {
+            "ruleset": "snap", "product": "snap-cf-%d" % counter[0],
+            "components": [
+                {"id": "a", "license": "S-1.0", "linkage": "static"},
+                {"id": "b", "license": "T-1.0", "linkage": "static"},
+            ],
+            "dependencies": [{"from": "a", "to": "b"}],
+        })
+        assert code == 200 and out["result"]["status"] == "conflict", out
+        return out["id"]
+
+    def review(ids, base=rev_v1, target=None):
+        return call(
+            "POST",
+            "/v1/rulesets/snap/revisions/%s/impact-review" % (target or rev_v2),
+            {"base_revision": base, "assessment_ids": ids},
+        )
+
+    def remediate(aid):
+        return call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                    {"components": {"b": [
+                        {"id": "s", "expression": "S-1.0", "cost": 1}]}})
+
+    def db_one(sql, params):
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            return conn.execute(sql, params).fetchone()
+        finally:
+            conn.close()
+
+    def db_exec(sql, params):
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            conn.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
+
+    # -- the four entries project the same persisted snapshot ---------------
+    ok_id, ok_hash = assess_ok()
+    cf_id = assess_conflict()
+    ok3_id, ok3_hash = assess_ok()  # confirmed only after v2 is activated
+
+    code, draft = call("POST", "/v1/rulesets/snap/revisions",
+                       {"rules": v2, "base_revision": rev_v1})
+    rev_v2 = draft.get("revision")
+    check("ledger: v2 drafted", code == 200 and rev_v2 and rev_v2 != rev_v1)
+
+    code, conf = call("POST", "/v1/assessments/%s/confirm" % ok_id)
+    check("ledger: confirm projects the pinned snapshot",
+          code == 200
+          and conf["replay"]["expected_summary_hash"] == ok_hash
+          and conf["replay"]["rules_hash"] == v1_hash)
+    code, cmp0 = call("POST", "/v1/assessments/compare",
+                      {"baseline_id": ok_id, "target_id": cf_id})
+    check("ledger: compare projects the persisted statuses",
+          code == 200 and cmp0["baseline_status"] == "ok"
+          and cmp0["target_status"] == "conflict")
+    code, self0 = call("POST", "/v1/assessments/compare",
+                       {"baseline_id": ok_id, "target_id": ok_id})
+    check("ledger: compare hash projection matches persisted summary",
+          code == 200
+          and self0["counterfactual"]["baseline_summary_hash"] == ok_hash)
+    code, rep0 = review([ok_id, cf_id])
+    items0 = {i["assessment_id"]: i for i in rep0.get("items", [])}
+    check("ledger: review projects the same persisted snapshot",
+          code == 200
+          and [i["assessment_id"] for i in rep0["items"]] == sorted([ok_id, cf_id])
+          and items0[ok_id]["old_summary_hash"] == ok_hash
+          and items0[ok_id]["old_status"] == "ok"
+          and items0[cf_id]["old_status"] == "conflict"
+          and items0[ok_id]["new_summary_hash"] != ok_hash
+          and items0[cf_id]["new_status"] == "conflict")
+    code, plan0 = remediate(cf_id)
+    check("ledger: remediation projects the pinned snapshot",
+          code == 200 and plan0["release"] is True
+          and plan0["reassessed"]["status"] == "ok")
+
+    # -- rule evolution must not move any projection -------------------------
+    code, act = call("POST", "/v1/rulesets/snap/revisions/%s/activate" % rev_v2,
+                     {"expected_active_revision": rev_v1})
+    check("ledger: v2 activated", code == 200 and act.get("activated") is True)
+
+    code, conf3 = call("POST", "/v1/assessments/%s/confirm" % ok3_id)
+    check("ledger: confirm stays on the historical snapshot after activation",
+          code == 200 and conf3["replay"]["rules_hash"] == v1_hash
+          and conf3["replay"]["expected_summary_hash"] == ok3_hash)
+    code, cmp1 = call("POST", "/v1/assessments/compare",
+                      {"baseline_id": ok_id, "target_id": cf_id})
+    check("ledger: compare hash stable across activation",
+          code == 200 and cmp1["comparison_hash"] == cmp0["comparison_hash"])
+    code, plan1 = remediate(cf_id)
+    check("ledger: remediation hash stable across activation",
+          code == 200 and plan1["remediation_hash"] == plan0["remediation_hash"])
+    code, body = review([ok_id], base=rev_v2, target=rev_v2)
+    check("ledger: review refuses assessments of a superseded revision",
+          code == 409 and body.get("reason") == "assessment-revision-mismatch")
+
+    code, _ = call("POST", "/v1/rulesets/snap/revisions/%s/activate" % rev_v1,
+                   {"expected_active_revision": rev_v2})
+    code, rep1 = review([ok_id, cf_id])
+    check("ledger: review projections stable across activation churn",
+          code == 200 and rep1["report_hash"] == rep0["report_hash"])
+
+    # -- tampered rows are refused wholesale by every entry ------------------
+    def expect_wholesale_refusal(aid, caid, label,
+                                 review_reason="rules-snapshot-unverifiable"):
+        code, _ = call("POST", "/v1/assessments/%s/confirm" % aid)
+        check("ledger: %s -> confirm 409" % label, code == 409)
+        code, _ = call("POST", "/v1/assessments/compare",
+                       {"baseline_id": aid, "target_id": aid})
+        check("ledger: %s -> compare 409" % label, code == 409)
+        code, body = call("POST", "/v1/assessments/%s/remediation-plan" % caid,
+                          {"components": {}})
+        check("ledger: %s -> remediation 409" % label,
+              code == 409 and body.get("reason") == "rules-snapshot-unverifiable")
+        code, body = review([aid])
+        check("ledger: %s -> impact review 409" % label,
+              code == 409 and body.get("reason") == review_reason)
+
+    # (a) stored summary_hash column no longer matches the persisted result
+    aid, _ = assess_ok()
+    caid = assess_conflict()
+    saved = db_one("SELECT summary_hash FROM assessments WHERE id = ?", (aid,))[0]
+    saved_c = db_one("SELECT summary_hash FROM assessments WHERE id = ?", (caid,))[0]
+    db_exec("UPDATE assessments SET summary_hash = ? WHERE id = ?", ("0" * 64, aid))
+    db_exec("UPDATE assessments SET summary_hash = ? WHERE id = ?", ("0" * 64, caid))
+    expect_wholesale_refusal(aid, caid, "tampered summary_hash")
+    db_exec("UPDATE assessments SET summary_hash = ? WHERE id = ?", (saved, aid))
+    db_exec("UPDATE assessments SET summary_hash = ? WHERE id = ?", (saved_c, caid))
+    code, _ = call("POST", "/v1/assessments/%s/confirm" % aid)
+    check("ledger: restored summary_hash confirms again", code == 200)
+
+    # (b) pinned rules snapshot replaced (id binding + revision broken)
+    aid, _ = assess_ok()
+    caid = assess_conflict()
+    orig = db_one("SELECT rules FROM assessments WHERE id = ?", (aid,))[0]
+    orig_c = db_one("SELECT rules FROM assessments WHERE id = ?", (caid,))[0]
+    foreign = json.dumps(validate_ruleset(v2), sort_keys=True)
+    db_exec("UPDATE assessments SET rules = ? WHERE id = ?", (foreign, aid))
+    db_exec("UPDATE assessments SET rules = ? WHERE id = ?", (foreign, caid))
+    expect_wholesale_refusal(aid, caid, "tampered rules snapshot")
+    db_exec("UPDATE assessments SET rules = ? WHERE id = ?", (orig, aid))
+    db_exec("UPDATE assessments SET rules = ? WHERE id = ?", (orig_c, caid))
+    code, _ = call("POST", "/v1/assessments/%s/confirm" % aid)
+    check("ledger: restored rules snapshot confirms again", code == 200)
+
+    # (c) recorded revision points nowhere
+    aid, _ = assess_ok()
+    caid = assess_conflict()
+    db_exec("UPDATE assessments SET revision = ? WHERE id = ?", ("0" * 16, aid))
+    db_exec("UPDATE assessments SET revision = ? WHERE id = ?", ("0" * 16, caid))
+    expect_wholesale_refusal(aid, caid, "tampered revision",
+                             review_reason="assessment-revision-mismatch")
+    db_exec("UPDATE assessments SET revision = ? WHERE id = ?", (rev_v1, aid))
+    db_exec("UPDATE assessments SET revision = ? WHERE id = ?", (rev_v1, caid))
+    code, _ = call("POST", "/v1/assessments/%s/confirm" % aid)
+    check("ledger: restored revision confirms again", code == 200)
+
+    # (d) legacy row (rules NULL) whose result can never be re-proven
+    aid, _ = assess_ok()
+    caid = assess_conflict()
+
+    def broken_result(raw):
+        result = json.loads(raw)
+        result["summary_hash"] = "0" * 64
+        return json.dumps(result, sort_keys=True)
+
+    kept = db_one("SELECT rules, result FROM assessments WHERE id = ?", (aid,))
+    kept_c = db_one("SELECT rules, result FROM assessments WHERE id = ?", (caid,))
+    db_exec("UPDATE assessments SET rules = NULL, result = ? WHERE id = ?",
+            (broken_result(kept[1]), aid))
+    db_exec("UPDATE assessments SET rules = NULL, result = ? WHERE id = ?",
+            (broken_result(kept_c[1]), caid))
+    expect_wholesale_refusal(aid, caid, "unrestorable legacy row")
+    db_exec("UPDATE assessments SET rules = ?, result = ? WHERE id = ?",
+            (kept[0], kept[1], aid))
+    db_exec("UPDATE assessments SET rules = ?, result = ? WHERE id = ?",
+            (kept_c[0], kept_c[1], caid))
+    code, _ = call("POST", "/v1/assessments/%s/confirm" % aid)
+    check("ledger: restored legacy row confirms again", code == 200)
+
+    # -- legacy rows continue only when restorable and re-proven -------------
+    aid, a_hash = assess_ok()
+    caid = assess_conflict()
+    db_exec("UPDATE assessments SET rules = NULL WHERE id = ?", (aid,))
+    db_exec("UPDATE assessments SET rules = NULL WHERE id = ?", (caid,))
+    code, conf_l = call("POST", "/v1/assessments/%s/confirm" % aid)
+    check("ledger: restorable legacy row confirms from the recovered snapshot",
+          code == 200 and conf_l["replay"]["rules_hash"] == v1_hash
+          and conf_l["replay"]["expected_summary_hash"] == a_hash)
+    row = db_one("SELECT rules, revision FROM assessments WHERE id = ?", (aid,))
+    check("ledger: recovery backfills the snapshot and revision",
+          row is not None and row[0] is not None and row[1] == rev_v1)
+    code, cmp_l = call("POST", "/v1/assessments/compare",
+                       {"baseline_id": aid, "target_id": aid})
+    check("ledger: recovered row compares",
+          code == 200 and cmp_l["conclusions_agree"] is True)
+    code, plan_l = remediate(caid)
+    check("ledger: recovered legacy conflict plans",
+          code == 200 and plan_l["release"] is True)
+    code, rep_l = review([aid, caid])
+    check("ledger: recovered rows review",
+          code == 200 and rep_l["assessed_count"] == 2)
+
+    # -- 404 semantics are unchanged -----------------------------------------
+    code, _ = call("POST", "/v1/assessments/%s/confirm" % ("e" * 32))
+    check("ledger: unknown assessment confirm -> 404", code == 404)
+    code, _ = call("POST", "/v1/assessments/compare",
+                   {"baseline_id": "e" * 32, "target_id": "e" * 32})
+    check("ledger: unknown assessment compare -> 404", code == 404)
+    code, _ = call("POST", "/v1/assessments/%s/remediation-plan" % ("e" * 32),
+                   {"components": {}})
+    check("ledger: unknown assessment remediation -> 404", code == 404)
+    code, body = review(["e" * 32])
+    check("ledger: unknown assessment review -> 409 assessment-not-found",
+          code == 409 and body.get("reason") == "assessment-not-found")
 
 
 def run_legacy_migration_checks():

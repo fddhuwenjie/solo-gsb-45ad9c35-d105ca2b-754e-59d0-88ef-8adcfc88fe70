@@ -12,9 +12,13 @@ assessment
 2. recorded that exact active revision.
 
 Any stale baseline, unknown target revision, unknown assessment,
-foreign-ruleset assessment or assessment recorded against a different
-revision fails the *whole* request with HTTP 409 -- no partial report is
-ever produced.
+foreign-ruleset assessment, assessment recorded against a different
+revision or assessment whose persisted accounting snapshot cannot be
+verified fails the *whole* request with HTTP 409 -- no partial report is
+ever produced.  Each accepted assessment is loaded through the shared
+immutable accounting snapshot (see ``app/ledger.py``) inside that same
+transaction, so the review projects exactly the data the confirmation,
+comparison and remediation entries would see.
 
 For the accepted batch each assessment is re-evaluated against the
 target revision's immutable rules snapshot.  The report gives, per
@@ -138,25 +142,26 @@ def _obligation_diff(before, after):
 # report assembly
 # ---------------------------------------------------------------------------
 
-def build_impact_report(name, target_revision, base_revision, rows, target_rules):
+def build_impact_report(name, target_revision, base_revision, snapshots, target_rules):
     """Re-evaluate every accepted assessment against the target snapshot.
 
-    *rows* are the persisted assessment rows fetched inside one read
-    transaction (``id`` / ``request`` / ``result`` plus provenance); they
-    are re-sorted here so the request's id ordering cannot influence the
-    report.  Re-evaluation happens outside the database transaction -- it
-    is a pure function of each pinned normalized request and the target
-    revision's immutable snapshot.
+    *snapshots* are the verified immutable accounting snapshots loaded
+    inside one read transaction (the same projection the confirmation,
+    comparison and remediation entries use); they are re-sorted here so
+    the request's id ordering cannot influence the report.  Re-evaluation
+    happens outside the database transaction -- it is a pure function of
+    each pinned normalized request and the target revision's immutable
+    snapshot.
     """
     items = []
     transitions = {}
     regressed_to_conflict = []
     regressed_to_error = []
 
-    for row in sorted(rows, key=lambda r: r["id"]):
-        aid = row["id"]
-        before = row["result"]
-        after = assess_normalized(row["request"], target_rules)
+    for snap in sorted(snapshots, key=lambda s: s.id):
+        aid = snap.id
+        before = snap.result
+        after = assess_normalized(snap.request, target_rules)
 
         old_status = before.get("status")
         new_status = after.get("status")
