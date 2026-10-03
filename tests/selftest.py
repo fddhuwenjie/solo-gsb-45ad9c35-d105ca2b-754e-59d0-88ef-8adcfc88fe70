@@ -17,8 +17,9 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.common import ConflictError, stable_hash  # noqa: E402
+from app.common import ConflictError, NotFound, stable_hash  # noqa: E402
 from app.rules import DEFAULT_RULESET, validate_ruleset  # noqa: E402
+from app.remediation import RemediationConflict  # noqa: E402
 from app.server import Api, make_server  # noqa: E402
 from app.solver import assess_normalized, normalize_request  # noqa: E402
 from app.store import Store  # noqa: E402
@@ -408,6 +409,10 @@ def run_checks():
 
     # -- legacy SQLite migration: verified rows heal, others are refused -----
     run_legacy_migration_checks()
+
+    # -- shared immutable accounting snapshots (confirm/compare/remediation/-
+    #    impact-review all read one proven snapshot, never active rules) ----
+    run_accounting_snapshot_checks()
 
     # -- immutable revisions, atomic activation, rollback & concurrency ------
     run_revision_checks()
@@ -4373,6 +4378,390 @@ def run_batch_snapshot_checks():
     )
 
 
+def run_accounting_snapshot_checks():
+    """Regression: the four accounting entry points share one immutable
+    proven snapshot (normalized request, result, summary_hash and rules
+    snapshot vs. revision, all checked in a read-only transaction).
+
+    On a dedicated database:
+
+    * tamper each persisted column in turn -- confirm, compare,
+      remediation and impact-review must all refuse the row with the same
+      409 (``rules-snapshot-unverifiable``), while untouched ids still
+      work;
+    * after the ruleset is overwritten by a new revision every entry
+      keeps operating on the *historical* snapshot (remediation replays
+      the old summary hash, impact review against the active revision is
+      a no-op, compare against the new assessment sees real rule diffs)
+      and never silently falls back to active rules;
+    * a missing id keeps its 404 semantics;
+    * once the ruleset is rolled back to the original content the
+      historical row verifies and confirms again.
+    """
+    tmp = tempfile.mkdtemp(prefix="licapi-accounting-")
+    db = os.path.join(tmp, "accounting.db")
+    store = Store(db)
+    api = Api(store)
+
+    v1 = validate_ruleset({
+        "licenses": {
+            "MIT": {"obligations": ["attribution"]},
+            "GPL-2.0-only": {"obligations": ["attribution", "source-offer"],
+                             "propagates": ["static"]},
+            "Apache-2.0": {"obligations": ["attribution"],
+                           "incompatible_with": ["GPL-2.0-only"]},
+        }
+    })
+    v2 = validate_ruleset({
+        "licenses": {
+            "MIT": {"obligations": ["attribution", "license-text"]},
+            "GPL-2.0-only": {"obligations": ["attribution", "source-offer"],
+                             "propagates": ["static"]},
+            "Apache-2.0": {"obligations": ["attribution"],
+                           "incompatible_with": ["GPL-2.0-only"]},
+        }
+    })
+    assert api.put_ruleset("snap", v1)["created"] is True
+    r1 = api.list_revisions("snap")["active_revision"]
+
+    ok_body = {
+        "ruleset": "snap",
+        "product": "snap-ok",
+        "components": [{"id": "m", "license": "MIT"}],
+    }
+    ok = api.create_assessment(json.loads(json.dumps(ok_body)))
+    aid_ok = ok["id"]
+    ok_hash = ok["result"]["summary_hash"]
+    assert ok["result"]["status"] == "ok"
+
+    conflict_body = {
+        "ruleset": "snap",
+        "product": "snap-conflict",
+        "components": [
+            {"id": "app", "license": "Apache-2.0"},
+            {"id": "g", "license": "GPL-2.0-only", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "app", "to": "g"}],
+    }
+    cf = api.create_assessment(json.loads(json.dumps(conflict_body)))
+    aid_cf = cf["id"]
+    cf_hash = cf["result"]["summary_hash"]
+    assert cf["result"]["status"] == "conflict"
+
+    def assert_refused(label, fn):
+        try:
+            fn()
+            check("accounting: %s refused" % label, False, "no error raised")
+        except ConflictError as exc:
+            check(
+                "accounting: %s refused (shared snapshot reason)" % label,
+                exc.details is not None
+                and exc.details.get("reason") == "rules-snapshot-unverifiable",
+                str(getattr(exc, "details", None)),
+            )
+
+    def assert_not_found(label, fn):
+        try:
+            fn()
+            check("accounting: %s -> 404" % label, False, "no error raised")
+        except NotFound:
+            check("accounting: %s -> 404" % label, True)
+
+    # -- untouched rows are accepted by every entry --------------------------
+    conf = api.confirm(aid_ok)
+    check("accounting: confirm uses the shared snapshot",
+          conf["replay"]["rules_hash"] == stable_hash(v1)
+          and conf["replay"]["expected_summary_hash"] == ok_hash)
+    rep = api.impact_review("snap", r1,
+                            {"base_revision": r1, "assessment_ids": [aid_ok]})
+    check("accounting: impact review on the active revision verifies the snapshot",
+          rep["items"][0]["new_summary_hash"] == ok_hash
+          and rep["summary"]["status_changed_count"] == 0)
+    out = api.compare({"baseline_id": aid_ok, "target_id": aid_cf})
+    check("accounting: compare loads two shared snapshots",
+          out["baseline_id"] == aid_ok and out["target_id"] == aid_cf)
+
+    # -- direct SQLite tampering: every entry refuses the same provenance ----
+    originals = {}
+    conn = sqlite3.connect(db)
+    for col in ("request", "result", "rules", "revision", "summary_hash"):
+        originals[col] = conn.execute(
+            "SELECT %s FROM assessments WHERE id = ?" % col, (aid_ok,)
+        ).fetchone()[0]
+
+    def write_col(col, value):
+        conn.execute(
+            "UPDATE assessments SET %s = ? WHERE id = ?" % col,
+            (value, aid_ok),
+        )
+        conn.commit()
+
+    tampered_request = json.loads(originals["request"])
+    tampered_request["product"] = "tampered"
+    write_col("request", json.dumps(tampered_request, sort_keys=True))
+    assert_refused("tampered request: confirm", lambda: api.confirm(aid_ok))
+    assert_refused("tampered request: compare",
+                   lambda: api.compare({"baseline_id": aid_ok, "target_id": aid_cf}))
+    assert_refused("tampered request: remediation",
+                   lambda: api.remediation_plan(
+                       aid_ok, {"components": {}}))
+    assert_refused("tampered request: impact review",
+                   lambda: api.impact_review(
+                       "snap", r1,
+                       {"base_revision": r1, "assessment_ids": [aid_ok]}))
+    # the untouched id keeps working even while the other row is corrupt
+    check("accounting: untouched row still reviewed while a peer is corrupt",
+          api.impact_review(
+              "snap", r1,
+              {"base_revision": r1, "assessment_ids": [aid_cf]}
+          )["items"][0]["new_summary_hash"] == cf_hash)
+    write_col("request", originals["request"])
+    check("accounting: restored row confirms again",
+          api.confirm(aid_ok)["replay"]["expected_summary_hash"] == ok_hash)
+
+    # tamper the stored conclusion body (the recorded summary_hash stays
+    # the old one, so replay of request+rules can no longer reproduce it)
+    tampered_result = json.loads(originals["result"])
+    if tampered_result.get("components"):
+        tampered_result["components"][0]["obligations"].append("tampered-obligation")
+        tampered_result["components"][0]["obligations"].sort()
+    else:
+        tampered_result["distribution"] = "saas"
+    write_col("result", json.dumps(tampered_result, sort_keys=True))
+    assert_refused("tampered result: confirm", lambda: api.confirm(aid_ok))
+    assert_refused("tampered result: compare",
+                   lambda: api.compare({"baseline_id": aid_cf, "target_id": aid_ok}))
+    assert_refused("tampered result: impact review",
+                   lambda: api.impact_review(
+                       "snap", r1,
+                       {"base_revision": r1,
+                        "assessment_ids": [aid_cf, aid_ok]}))
+    write_col("result", originals["result"])
+
+    write_col("rules", json.dumps(v2, sort_keys=True))
+    assert_refused("swapped rules snapshot: confirm", lambda: api.confirm(aid_ok))
+    assert_refused("swapped rules snapshot: remediation",
+                   lambda: api.remediation_plan(
+                       aid_ok, {"components": {}}))
+    assert_refused("swapped rules snapshot: impact review",
+                   lambda: api.impact_review(
+                       "snap", r1,
+                       {"base_revision": r1, "assessment_ids": [aid_ok]}))
+    write_col("rules", originals["rules"])
+
+    # same swap on the conflict row, exercised through remediation
+    conn.commit()
+    conn.execute(
+        "UPDATE assessments SET rules = ? WHERE id = ?",
+        (json.dumps(v2, sort_keys=True), aid_cf),
+    )
+    conn.commit()
+    assert_refused("swapped rules snapshot: remediation (conflict row)",
+                   lambda: api.remediation_plan(
+                       aid_cf, {"components": {}}))
+    conn.execute(
+        "UPDATE assessments SET rules = ? WHERE id = ?",
+        (originals["rules"], aid_cf),
+    )
+    conn.commit()
+
+    write_col("revision", "0" * 16)
+    assert_refused("stale revision pointer: confirm", lambda: api.confirm(aid_ok))
+    assert_refused("stale revision pointer: compare",
+                   lambda: api.compare({"baseline_id": aid_ok, "target_id": aid_ok}))
+    # impact review catches the fake pointer at its revision-mismatch
+    # gate (same whole-batch 409 semantics, never a report)
+    try:
+        api.impact_review("snap", r1,
+                          {"base_revision": r1, "assessment_ids": [aid_ok]})
+        check("accounting: stale revision pointer: impact review refused",
+              False, "no error raised")
+    except ConflictError as exc:
+        check(
+            "accounting: stale revision pointer: impact review refused",
+            exc.details is not None
+            and exc.details.get("reason") == "assessment-revision-mismatch",
+            str(getattr(exc, "details", None)),
+        )
+    write_col("revision", originals["revision"])
+
+    write_col("summary_hash", "0" * 64)
+    assert_refused("tampered summary_hash column: confirm",
+                   lambda: api.confirm(aid_ok))
+    assert_refused("tampered summary_hash column: compare",
+                   lambda: api.compare({"baseline_id": aid_ok, "target_id": aid_ok}))
+    assert_refused("tampered summary_hash column: remediation",
+                   lambda: api.remediation_plan(
+                       aid_ok, {"components": {}}))
+    assert_refused("tampered summary_hash column: impact review",
+                   lambda: api.impact_review(
+                       "snap", r1,
+                       {"base_revision": r1, "assessment_ids": [aid_ok]}))
+    write_col("summary_hash", originals["summary_hash"])
+
+    # an unverifiable id poisons an impact-review batch as one 409
+    # payload.  Simulate a corrupt (un-restorable) named snapshot: an
+    # unpinned rules column pointing at a ruleset whose stored content
+    # cannot reproduce the row's hash, under a revision that still
+    # matches the active one so the batch reaches the shared snapshot
+    # gate.
+    other = validate_ruleset({
+        "licenses": {"MIT": {"obligations": ["attribution", "notice-preserve"]}}
+    })
+    write_col("rules", None)
+    mirror = conn.execute(
+        "SELECT body FROM rulesets WHERE name = 'snap'"
+    ).fetchone()[0]
+    conn.execute(
+        "UPDATE rulesets SET body = ? WHERE name = 'snap'",
+        (json.dumps(other, sort_keys=True),),
+    )
+    conn.commit()
+    try:
+        api.impact_review("snap", r1,
+                          {"base_revision": r1,
+                           "assessment_ids": [aid_cf, aid_ok]})
+        check("accounting: unverifiable id fails the whole review batch",
+              False, "no error raised")
+    except ConflictError as exc:
+        check(
+            "accounting: unverifiable id fails the whole review batch",
+            exc.details is not None
+            and exc.details.get("reason") == "rules-snapshot-unverifiable"
+            and exc.details.get("assessment_ids") == [aid_ok],
+            str(getattr(exc, "details", None)),
+        )
+    # the single-load entries refuse the same corrupt row too
+    assert_refused("unrestorable row: confirm", lambda: api.confirm(aid_ok))
+    assert_refused("unrestorable row: compare",
+                   lambda: api.compare({"baseline_id": aid_ok, "target_id": aid_cf}))
+    write_col("rules", originals["rules"])
+    conn.execute("UPDATE rulesets SET body = ? WHERE name = 'snap'", (mirror,))
+    conn.commit()
+    conn.close()
+
+    # -- missing ids keep the 404 semantics at each entry --------------------
+    missing = "f" * 32
+    assert_not_found("missing confirm", lambda: api.confirm(missing))
+    assert_not_found("missing remediation",
+                     lambda: api.remediation_plan(missing, {"components": {}}))
+    assert_not_found("missing compare baseline",
+                     lambda: api.compare({"baseline_id": missing,
+                                          "target_id": aid_ok}))
+    assert_not_found("missing compare target",
+                     lambda: api.compare({"baseline_id": aid_ok,
+                                          "target_id": missing}))
+    try:
+        api.impact_review("snap", r1,
+                          {"base_revision": r1, "assessment_ids": [missing]})
+        check("accounting: missing impact-review id -> 409 (existing semantics)",
+              False, "no error raised")
+    except ConflictError as exc:
+        check(
+            "accounting: missing impact-review id -> 409 (existing semantics)",
+            exc.details is not None
+            and exc.details.get("reason") == "assessment-not-found",
+            str(getattr(exc, "details", None)),
+        )
+
+    # -- overwrite the ruleset: historical snapshots stay authoritative ------
+    api.put_ruleset("snap", v2)
+    r2 = api.list_revisions("snap")["active_revision"]
+    check("accounting: overwrite published a new revision", r2 != r1)
+
+    # same request under active rules is a *different* assessment/hash
+    ok_v2 = api.create_assessment(json.loads(json.dumps(ok_body)))
+    check(
+        "accounting: new rules mint a new assessment",
+        ok_v2["id"] != aid_ok and ok_v2["result"]["summary_hash"] != ok_hash,
+    )
+
+    # confirm still replays the pre-overwrite snapshot, never v2
+    conf = api.confirm(aid_ok)
+    check(
+        "accounting: confirm after overwrite pins the historical snapshot",
+        conf["replay"]["rules_hash"] == stable_hash(v1)
+        and conf["replay"]["rules_hash"] != stable_hash(v2)
+        and conf["replay"]["expected_summary_hash"] == ok_hash,
+    )
+
+    # remediation re-assesses under the historical v1 snapshot: the best
+    # plan's reassessed hash is the *old* conflict hash, not a v2 result
+    body = {"components": {"g": [{"id": "mit", "expression": "MIT", "cost": 1}]}}
+    plan = None
+    try:
+        plan = api.remediation_plan(aid_cf, body)
+        check("accounting: remediation after overwrite becomes releasable",
+              plan is not None and plan["release"] is True)
+    except RemediationConflict:
+        check("accounting: remediation after overwrite becomes releasable",
+              False, "no release plan found")
+    if plan is not None:
+        check(
+            "accounting: remediation replays historical (v1) rules",
+            plan["reassessed"]["summary_hash"]
+            == assess_normalized(
+                normalize_request({
+                    "components": [
+                        {"id": "app", "license": "Apache-2.0"},
+                        {"id": "g", "license": "MIT", "linkage": "static"},
+                    ],
+                    "dependencies": [{"from": "app", "to": "g"}],
+                }),
+                v1,
+            )["summary_hash"],
+        )
+        check("accounting: remediation payload fields unchanged",
+              "remediation_hash" in plan and "total_cost" in plan
+              and plan["assessment_id"] == aid_cf)
+
+    # compare of the two revisions runs on each side's own snapshot and
+    # sees the real MIT license-rule difference (plus product diffs)
+    out = api.compare({"baseline_id": aid_ok, "target_id": ok_v2["id"]})
+    check(
+        "accounting: compare mixes historical and current snapshots, no fallback",
+        any(d["kind"] == "license-rule" and d["license"] == "MIT"
+            for d in out["diffs"])
+        and out["counterfactual"]["baseline_summary_hash"] == ok_hash,
+        json.dumps(out["diffs"])[:240],
+    )
+
+    # impact review prepared at the now-active r2 with target r2 is a
+    # no-op for the *new* (r2-recorded) assessment; the old r1 row is
+    # excluded with the existing revision-mismatch semantics instead of
+    # being silently re-read under active rules
+    rep = api.impact_review("snap", r2,
+                            {"base_revision": r2,
+                             "assessment_ids": [ok_v2["id"]]})
+    check("accounting: impact review on active r2 re-runs the r2 snapshot",
+          rep["items"][0]["new_summary_hash"] == ok_v2["result"]["summary_hash"]
+          and rep["summary"]["status_changed_count"] == 0)
+    try:
+        api.impact_review("snap", r2,
+                          {"base_revision": r2, "assessment_ids": [aid_ok]})
+        check("accounting: old-revision row not accepted under active r2",
+              False, "no error raised")
+    except ConflictError as exc:
+        check(
+            "accounting: old-revision row not accepted under active r2",
+            exc.details is not None
+            and exc.details.get("reason") == "assessment-revision-mismatch"
+            and exc.details.get("assessment_ids") == [aid_ok],
+            str(getattr(exc, "details", None)),
+        )
+
+    # rollback to the original content: the historical row verifies again
+    api.activate_revision("snap", r1, {"expected_active_revision": r2})
+    check(
+        "accounting: historical row verifies after content rollback",
+        api.impact_review(
+            "snap", r1,
+            {"base_revision": r1, "assessment_ids": [aid_cf]}
+        )["items"][0]["new_summary_hash"] == cf_hash
+        and api.confirm(aid_ok)["replay"]["expected_summary_hash"] == ok_hash,
+    )
+
+
 def run_legacy_migration_checks():
     """Open a pre-upgrade database (assessments without a rules snapshot).
 
@@ -4508,6 +4897,51 @@ def run_legacy_migration_checks():
         "legacy healed row self-compare",
         out["diff_count"] == 0 and out["conclusions_agree"] is True,
     )
+
+    # the shared snapshot gate also backs impact review: the healed row
+    # (stamped with the migrated default revision) is reviewed cleanly
+    # against the active revision, while an un-restorable row fails the
+    # whole batch with the same rules-snapshot-unverifiable reason
+    default_rev = api.list_revisions("default")["active_revision"]
+    try:
+        rep = api.impact_review(
+            "default", default_rev,
+            {"base_revision": default_rev, "assessment_ids": [heal_aid]},
+        )
+        ok_review = (
+            rep["assessed_count"] == 1
+            and rep["items"][0]["new_summary_hash"] == heal_hash
+            and rep["summary"]["status_changed_count"] == 0
+        )
+    except ConflictError:
+        ok_review = False
+    check("legacy healed row accepted by impact review", ok_review)
+    for aid, why in ((over_aid, "overwritten"), (inline_aid, "inline")):
+        try:
+            api.impact_review(
+                "default", default_rev,
+                {"base_revision": default_rev, "assessment_ids": [aid]},
+            )
+            refused = False
+        except ConflictError as exc:
+            refused = exc.details is not None and exc.details.get("reason") in (
+                "rules-snapshot-unverifiable",
+                "assessment-ruleset-mismatch",
+                "assessment-revision-mismatch",
+            )
+        # neither row can ever be reviewed under guessed or active rules
+        check("legacy %s row impact review refused (409)" % why, refused)
+    try:
+        api.impact_review(
+            "default", default_rev,
+            {"base_revision": default_rev,
+             "assessment_ids": [heal_aid, over_aid]},
+        )
+        batch_refused = False
+    except ConflictError:
+        batch_refused = True
+    check("legacy one unverifiable row fails the whole review batch",
+          batch_refused)
 
     # restoring the original ruleset content makes the row verifiable again
     api.store.put_ruleset("legacy", legacy_rules)

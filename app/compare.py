@@ -317,7 +317,12 @@ def find_minimal_rollback(diffs, t_request, t_rules, t_result, baseline_sig):
 # ---------------------------------------------------------------------------
 
 def compare_assessments(baseline, target):
-    """Compare two persisted assessment rows (request + rules + result).
+    """Compare two verified immutable accounting snapshots.
+
+    Both arguments are :class:`~app.accounting.AccountingSnapshot` values
+    loaded through the shared store loader, so their normalized request,
+    rules snapshot and persisted result are proven against their
+    ``summary_hash`` and revision before this function ever runs.
 
     Returns the full atomic diff list, the globally minimal rollback
     (attribution) set, a summary of the counterfactual outcome and a
@@ -325,22 +330,22 @@ def compare_assessments(baseline, target):
     the minimal set is empty.
     """
     diffs = build_diffs(
-        baseline["request"], baseline["rules"],
-        target["request"], target["rules"],
+        baseline.request, baseline.rules,
+        target.request, target.rules,
     )
-    baseline_sig = result_signature(baseline["result"])
+    baseline_sig = result_signature(baseline.result)
     minimal, outcome = find_minimal_rollback(
         diffs,
-        target["request"],
-        target["rules"],
-        target["result"],
+        target.request,
+        target.rules,
+        target.result,
         baseline_sig,
     )
     out = {
-        "baseline_id": baseline["id"],
-        "target_id": target["id"],
-        "baseline_status": baseline["result"].get("status"),
-        "target_status": target["result"].get("status"),
+        "baseline_id": baseline.id,
+        "target_id": target.id,
+        "baseline_status": baseline.result.get("status"),
+        "target_status": target.result.get("status"),
         "conclusions_agree": not minimal,
         "diff_count": len(diffs),
         "diffs": diffs,
@@ -350,7 +355,7 @@ def compare_assessments(baseline, target):
             "status": outcome.get("status"),
             "release": outcome.get("release"),
             "summary_hash": outcome.get("summary_hash"),
-            "baseline_summary_hash": baseline["result"].get("summary_hash"),
+            "baseline_summary_hash": baseline.result.get("summary_hash"),
             "restores_baseline_conclusion": True,
         },
     }

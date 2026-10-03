@@ -6,6 +6,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 
+from .accounting import AccountingSnapshot, verify_accounting_tuple
 from .batches import assemble_manifest, canonical_entries
 from .common import ConflictError, NotFound, stable_hash
 from .fulfillment import UnprocessableError
@@ -226,11 +227,12 @@ class Store:
             return None
         rules = json.loads(rs["body"])
         request = json.loads(row["request"])
-        if stable_hash({"request": request, "rules": rules})[:32] != row["id"]:
-            return None
-        stored = json.loads(row["result"])
-        replayed = assess_normalized(request, rules)
-        if replayed.get("summary_hash") != stored.get("summary_hash"):
+        # Every acceptance criterion is one call to the same pure
+        # correspondence verifier the shared accounting-snapshot loader
+        # uses (normalized request, id binding, replay summary hash).
+        if not verify_accounting_tuple(
+            row["id"], request, json.loads(row["result"]), rules
+        ):
             return None
         return rules
 
@@ -275,6 +277,144 @@ class Store:
                 return rules
             finally:
                 conn.close()
+
+    # -- shared immutable accounting snapshots ----------------------------
+
+    _ACCOUNTING_COLS = "id, ruleset, rules, revision, request, result, summary_hash"
+
+    @staticmethod
+    def _unverifiable_snapshot_error(aid, ruleset, action="use"):
+        """The single 409 wording every entry point gives for a bad snapshot."""
+        if not ruleset:
+            reason = (
+                "the assessment used inline rules that were never persisted; "
+                "re-submit the assessment to bind a rules snapshot"
+            )
+        else:
+            reason = (
+                "the original rules snapshot can no longer be verified "
+                "(request, result, summary_hash or ruleset revision mismatch)"
+            )
+        return ConflictError(
+            "cannot %s assessment %r: %s" % (action, aid, reason),
+            {"reason": "rules-snapshot-unverifiable"},
+        )
+
+    def _accounting_snapshot_from_row(self, conn, row, action="use"):
+        """Verify one row inside an open read transaction, or raise 409.
+
+        Pinned snapshots are proven against their immutable revision row;
+        pre-revision rows are accepted only when their rules can be
+        recovered in this same transaction and replay reproduces the
+        stored summary hash.  Never falls back to active rules.
+        """
+        aid = row["id"]
+        request = json.loads(row["request"])
+        result = json.loads(row["result"])
+        ruleset = row["ruleset"]
+        revision = row["revision"]
+        rules = json.loads(row["rules"]) if row["rules"] is not None else None
+
+        if rules is None:
+            # Best-effort legacy recovery inside the read transaction:
+            # recover, verify and use the recovered rules, but never
+            # write -- the transaction stays read-only for every entry.
+            rules = self._verified_legacy_rules(conn, row)
+            if rules is None:
+                raise self._unverifiable_snapshot_error(aid, ruleset, action=action)
+            if ruleset:
+                rid = revision_id(rules)
+                hit = conn.execute(
+                    "SELECT 1 FROM ruleset_revisions"
+                    " WHERE ruleset_name = ? AND revision = ?",
+                    (ruleset, rid),
+                ).fetchone()
+                if hit is not None:
+                    revision = rid
+                elif revision is not None:
+                    # A pinned (modern) row whose snapshot content no
+                    # longer matches its recorded revision is corrupt:
+                    # legacy recovery must not silently substitute the
+                    # ruleset's current content for it.
+                    raise self._unverifiable_snapshot_error(
+                        aid, ruleset, action=action
+                    )
+
+        if not verify_accounting_tuple(
+            aid, request, result, rules, summary_hash=row["summary_hash"]
+        ):
+            raise self._unverifiable_snapshot_error(aid, ruleset, action=action)
+
+        if revision is not None:
+            rev_row = conn.execute(
+                "SELECT content_hash FROM ruleset_revisions"
+                " WHERE ruleset_name = ? AND revision = ?",
+                (ruleset, revision),
+            ).fetchone()
+            if rev_row is None or rev_row["content_hash"] != stable_hash(rules):
+                raise self._unverifiable_snapshot_error(aid, ruleset, action=action)
+
+        return AccountingSnapshot(
+            aid, ruleset, revision, rules, request, result
+        )
+
+    def load_accounting_snapshot(self, aid, action="use"):
+        """Load and verify one assessment's immutable accounting snapshot.
+
+        Read and every correspondence check (normalized request, id
+        binding, replayed ``summary_hash``, rules snapshot vs. revision)
+        happen in one deferred read transaction, so the tuple is a single
+        consistent read.  A missing assessment raises NotFound; a row that
+        cannot be proven raises ConflictError.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                "SELECT %s FROM assessments WHERE id = ?" % self._ACCOUNTING_COLS,
+                (aid,),
+            ).fetchone()
+            if row is None:
+                raise NotFound("assessment %r not found" % aid)
+            return self._accounting_snapshot_from_row(conn, row, action=action)
+        finally:
+            conn.rollback()
+            conn.close()
+
+    def load_accounting_snapshots(self, ids, action="use"):
+        """Load/verify every assessment of *ids* in one read transaction.
+
+        Returns the verified snapshots in the requested id order (callers
+        re-sort as they see fit).  Any unknown id (checked in the order
+        given) raises NotFound; the first unverifiable row raises
+        ConflictError -- the whole batch is refused, never projected
+        partially.
+        """
+        ids = list(ids)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            placeholders = ",".join("?" for _ in ids)
+            found = {
+                r["id"]: r
+                for r in conn.execute(
+                    "SELECT %s FROM assessments WHERE id IN (%s)"
+                    % (self._ACCOUNTING_COLS, placeholders),
+                    ids,
+                ).fetchall()
+            }
+            snapshots = []
+            for aid in ids:
+                row = found.get(aid)
+                if row is None:
+                    raise NotFound("assessment %r not found" % aid)
+                snapshots.append(
+                    self._accounting_snapshot_from_row(conn, row, action=action)
+                )
+            return snapshots
+        finally:
+            conn.rollback()
+            conn.close()
 
     # -- rulesets (legacy PUT/GET semantics, revision-backed) -------------
 
@@ -821,7 +961,7 @@ class Store:
             found = {
                 r["id"]: r
                 for r in conn.execute(
-                    "SELECT id, ruleset, revision, request, result"
+                    "SELECT id, ruleset, rules, revision, request, result, summary_hash"
                     " FROM assessments WHERE id IN (%s)" % placeholders,
                     list(ids),
                 ).fetchall()
@@ -864,6 +1004,32 @@ class Store:
                         "reason": "assessment-revision-mismatch",
                         "active_revision": active_rev,
                         "assessment_ids": mismatched,
+                    },
+                )
+
+            # Every row must pass the same immutable accounting-snapshot
+            # verification as confirmation/comparison/remediation -- in
+            # this same read transaction: normalized request, id binding,
+            # replayed summary hash, and the rules snapshot equal to the
+            # revision content.  A tampered or un-restorable legacy row
+            # refuses the whole review; the active ruleset is never used
+            # as a substitute.
+            unverifiable = []
+            for aid in ids:
+                try:
+                    self._accounting_snapshot_from_row(conn, found[aid])
+                except ConflictError:
+                    unverifiable.append(aid)
+            if unverifiable:
+                raise ConflictError(
+                    "impact review accepts only assessments whose request, "
+                    "result, summary_hash and rules snapshot can be verified "
+                    "against their recorded revision; these ids cannot: %s"
+                    % ", ".join(sorted(unverifiable)),
+                    {
+                        "reason": "rules-snapshot-unverifiable",
+                        "active_revision": active_rev,
+                        "assessment_ids": sorted(unverifiable),
                     },
                 )
 

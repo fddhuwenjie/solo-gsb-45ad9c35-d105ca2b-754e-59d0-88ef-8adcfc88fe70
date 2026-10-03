@@ -9,12 +9,18 @@ active revision inside it and accepts the batch only when every
 assessment
 
 1. belongs to that ruleset, and
-2. recorded that exact active revision.
+2. recorded that exact active revision, and
+3. passes the *shared immutable accounting snapshot* verification used by
+   confirmation/comparison/remediation: the persisted request is
+   normalized, the id binds it to the stored rules snapshot, replay
+   reproduces the stored ``summary_hash`` (and the result body hashes to
+   it), and the rules snapshot's content hash matches the recorded
+   revision -- all in that same transaction.
 
 Any stale baseline, unknown target revision, unknown assessment,
-foreign-ruleset assessment or assessment recorded against a different
-revision fails the *whole* request with HTTP 409 -- no partial report is
-ever produced.
+foreign-ruleset assessment, assessment recorded against a different
+revision or assessment whose accounting snapshot cannot be proven fails
+the *whole* request with HTTP 409 -- no partial report is ever produced.
 
 For the accepted batch each assessment is re-evaluated against the
 target revision's immutable rules snapshot.  The report gives, per

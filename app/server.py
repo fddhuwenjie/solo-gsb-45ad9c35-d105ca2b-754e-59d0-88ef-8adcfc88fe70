@@ -203,43 +203,27 @@ class Api:
     # -- confirmation -----------------------------------------------------
 
     def confirm(self, aid):
-        row = self.store.get_assessment(aid)
-        if row is None:
-            raise NotFound("assessment %r not found" % aid)
+        # Load the shared immutable accounting snapshot first: existence
+        # is 404, and anything that cannot be proven -- normalized
+        # request/result, summary_hash replay, rules snapshot vs. the
+        # recorded revision -- is refused as a whole (409) even when a
+        # confirmation already exists, so a corrupt row can never be
+        # served from the confirmations mirror.  Pre-upgrade rows are
+        # accepted only when their rules can be recovered and replay
+        # reproduces; current active rules are never substituted.
+        snapshot = self.store.load_accounting_snapshot(aid, action="confirm")
         existing = self.store.get_confirmation(aid)
         if existing is not None:
             return existing
-        result = row["result"]
+        result = snapshot.result
         if result.get("status") != "ok":
             raise ConflictError(
                 "assessment status is %r; no release conclusion available"
                 % result.get("status")
             )
-        # A confirmation is only minted when the exact rules the assessment
-        # ran with are known.  Newer rows always carry the pinned snapshot;
-        # pre-upgrade rows are accepted only when their rules can be verified
-        # and restored (see Store.recover_legacy_rules).  A deleted/overwritten
-        # ruleset or a legacy inline-rule request can never be reconstructed --
-        # refuse rather than fabricate a replay that may not reproduce.
-        rules = row["rules"]
-        if rules is None:
-            rules = self.store.recover_legacy_rules(aid)
-        if rules is None:
-            if not row["ruleset"]:
-                reason = (
-                    "the assessment used inline rules that were never persisted; "
-                    "re-submit the assessment to bind a rules snapshot"
-                )
-            else:
-                reason = (
-                    "the original ruleset %r can no longer be verified "
-                    "(ruleset deleted or overwritten since the assessment)"
-                    % row["ruleset"]
-                )
-            raise ConflictError(
-                "cannot confirm assessment %r: %s" % (aid, reason)
-            )
-        conf = build_confirmation(row["request"], result, rules, aid, row["ruleset"])
+        conf = build_confirmation(
+            snapshot.request, result, snapshot.rules, aid, snapshot.ruleset
+        )
         self.store.put_confirmation(aid, conf)
         return conf
 
@@ -306,16 +290,14 @@ class Api:
     # -- remediation plan ---------------------------------------------------
 
     def remediation_plan(self, aid, body):
-        row = self.store.get_assessment(aid)
-        if row is None:
-            raise NotFound("assessment %r not found" % aid)
-        # plan_remediation verifies the pinned normalized request and
-        # rules snapshot itself and refuses (409) when it cannot prove
-        # them or the status is not "conflict" -- never falling back to
-        # current active rules.
-        if row["rules"] is None:
-            row["rules"] = self.store.recover_legacy_rules(aid)
-        return plan_remediation(row, body, aid)
+        # The shared immutable snapshot is the only input to remediation
+        # planning: existence is 404, an unverifiable snapshot is a
+        # wholesale 409, and planning always runs against the pinned
+        # historical rules -- never the currently active ruleset.
+        snapshot = self.store.load_accounting_snapshot(
+            aid, action="plan remediation for"
+        )
+        return plan_remediation(snapshot, body, aid)
 
     # -- comparison -----------------------------------------------------
 
@@ -328,38 +310,16 @@ class Api:
             raise ClientError("baseline_id must be a non-empty string")
         if not isinstance(target_id, str) or not target_id:
             raise ClientError("target_id must be a non-empty string")
-        baseline = self._assessment_with_rules(baseline_id)
-        target = self._assessment_with_rules(target_id)
+        # Both sides come from one shared, immutable accounting snapshot
+        # load -- a single read transaction proves both rows (normalized
+        # request, result/self-hash, replayed summary_hash, rules
+        # snapshot vs. revision), with 404 for missing ids and a
+        # wholesale 409 for any row that cannot be proven.  A comparison
+        # can never pair a historical snapshot with active rules.
+        baseline, target = self.store.load_accounting_snapshots(
+            [baseline_id, target_id], action="compare"
+        )
         return compare_assessments(baseline, target)
-
-    def _assessment_with_rules(self, aid):
-        """Fetch an assessment row, refusing ones without provable rules.
-
-        Pre-upgrade rows are accepted only when their rules can be
-        verified and restored (the same rule confirmations follow); a
-        deleted/overwritten ruleset or a legacy inline-rule request can
-        never be reconstructed -- refuse rather than comparing against
-        guessed rules.
-        """
-        row = self.store.get_assessment(aid)
-        if row is None:
-            raise NotFound("assessment %r not found" % aid)
-        if row["rules"] is None:
-            row["rules"] = self.store.recover_legacy_rules(aid)
-        if row["rules"] is None:
-            if not row["ruleset"]:
-                reason = (
-                    "the assessment used inline rules that were never persisted; "
-                    "re-submit the assessment to bind a rules snapshot"
-                )
-            else:
-                reason = (
-                    "the original ruleset %r can no longer be verified "
-                    "(ruleset deleted or overwritten since the assessment)"
-                    % row["ruleset"]
-                )
-            raise ConflictError("cannot compare assessment %r: %s" % (aid, reason))
-        return row
 
     # -- immutable release batches ----------------------------------------
 
